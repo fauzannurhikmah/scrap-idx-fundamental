@@ -26,9 +26,42 @@ HEADERS = {
 
 BASE_URL = "https://www.idx.co.id"
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls"}
-MAX_ATTACHMENTS_TO_PARSE = 2
+MAX_ATTACHMENTS_TO_PARSE = 4
 MAX_CHARS_PER_FILE = 8000
 MAX_TOTAL_CHARS = 14000
+
+PRIORITY_KEYWORDS = [
+    "financial",
+    "keuangan",
+    "laporan-keuangan",
+    "quarter",
+    "kuartal",
+    "interim",
+]
+LOW_PRIORITY_KEYWORDS = [
+    "esg",
+    "sustainability",
+    "keberlanjutan",
+]
+
+FINANCIAL_TEXT_KEYWORDS = [
+    "pendapatan",
+    "revenue",
+    "laba",
+    "net profit",
+    "operating profit",
+    "aset",
+    "asset",
+    "liabilitas",
+    "equity",
+    "ekuitas",
+    "eps",
+    "roe",
+    "roa",
+    "der",
+    "current ratio",
+    "arus kas",
+]
 
 
 def _create_scraper():
@@ -118,6 +151,28 @@ def _extract_attachment_text(file_name: str, content: bytes) -> str:
     return ""
 
 
+def _focus_financial_text(raw_text: str) -> str:
+    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    selected_indexes = set()
+    for i, line in enumerate(lines):
+        lower_line = line.lower()
+        if any(keyword in lower_line for keyword in FINANCIAL_TEXT_KEYWORDS):
+            selected_indexes.add(i)
+            if i - 1 >= 0:
+                selected_indexes.add(i - 1)
+            if i + 1 < len(lines):
+                selected_indexes.add(i + 1)
+
+    if not selected_indexes:
+        return "\n".join(lines[:200])
+
+    focused_lines = [lines[i] for i in sorted(selected_indexes)]
+    return "\n".join(focused_lines)
+
+
 def _collect_report_text(raw_data: dict) -> tuple[str, list[dict]]:
     attachments = raw_data.get("Attachments") or []
     eligible = []
@@ -129,6 +184,19 @@ def _collect_report_text(raw_data: dict) -> tuple[str, list[dict]]:
             ext = "." + file_name.lower().split(".")[-1]
         if ext in SUPPORTED_EXTENSIONS:
             eligible.append(item)
+
+    def score_attachment(item: dict) -> int:
+        file_name = str(item.get("File_Name") or "").lower()
+        score = 0
+        for kw in PRIORITY_KEYWORDS:
+            if kw in file_name:
+                score += 3
+        for kw in LOW_PRIORITY_KEYWORDS:
+            if kw in file_name:
+                score -= 2
+        return score
+
+    eligible.sort(key=score_attachment, reverse=True)
 
     parsed_docs = []
     text_chunks = []
@@ -142,6 +210,7 @@ def _collect_report_text(raw_data: dict) -> tuple[str, list[dict]]:
         try:
             content = _download_file(file_url)
             extracted = _extract_attachment_text(file_name, content)
+            extracted = _focus_financial_text(extracted)
         except Exception:
             extracted = ""
 

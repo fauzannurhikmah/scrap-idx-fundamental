@@ -41,29 +41,89 @@ def get_fundamental():
     try:
         fundamental_data = scrape_fundamental(symbol, year, quarter)
     except Exception:
-        return jsonify({"status": "error", "message": "Failed to retrieve data from IDX. Please try again later."}), 502
+        return jsonify({
+            "status": "error",
+            "message": "Failed to retrieve data from IDX. Please try again later."
+        }), 502
 
+    # EXISTING EXTRACTION 
     try:
         extracted_metrics = extract_financial_metrics(fundamental_data)
         current_data = fundamental_data.get("data") or {}
+
         for key, value in extracted_metrics.items():
             if current_data.get(key) in (None, "") and value not in (None, ""):
                 current_data[key] = value
+
         fundamental_data["data"] = current_data
     except Exception:
-        # Keep request successful even when metric extraction is unavailable.
+        current_data = fundamental_data.get("data") or {}
+
+    #  CALCULATION LAYER (SAFE ADDITION)
+    try:
+        revenue = current_data.get("revenue")
+        net_income = current_data.get("net_profit")
+        total_assets = current_data.get("total_assets")
+        total_equity = current_data.get("total_equity")
+        shares = current_data.get("shares_outstanding")
+        price = current_data.get("price")
+
+        # NPM
+        if current_data.get("npm") in (None, "") and revenue and net_income:
+            try:
+                current_data["npm"] = round((net_income / revenue) * 100, 2)
+            except Exception:
+                pass
+
+        # Total Liabilities
+        if current_data.get("total_liabilities") in (None, "") and total_assets and total_equity:
+            try:
+                current_data["total_liabilities"] = total_assets - total_equity
+            except Exception:
+                pass
+
+        # EPS
+        if current_data.get("eps") in (None, "") and net_income and shares:
+            try:
+                current_data["eps"] = net_income / shares
+            except Exception:
+                pass
+
+        # BVPS
+        if current_data.get("book_value_per_share") in (None, "") and total_equity and shares:
+            try:
+                current_data["book_value_per_share"] = total_equity / shares
+            except Exception:
+                pass
+
+        # PER
+        if current_data.get("per") in (None, "") and price and current_data.get("eps"):
+            try:
+                current_data["per"] = price / current_data.get("eps")
+            except Exception:
+                pass
+
+        # PBR
+        if current_data.get("pbr") in (None, "") and price and current_data.get("book_value_per_share"):
+            try:
+                current_data["pbr"] = price / current_data.get("book_value_per_share")
+            except Exception:
+                pass
+
+    except Exception:
         pass
 
+    # EXISTING AI SUMMARY (UNCHANGED)
     try:
         summary = summarize_fundamental(fundamental_data)
     except Exception:
         summary = "AI summarization is currently unavailable. Please try again later."
 
-    # Construct the new response format
+    # RESPONSE (UNCHANGED STRUCTURE)
     response = {
         "meta": {
             "kode_emiten": fundamental_data.get("symbol"),
-            "nama_emiten": fundamental_data.get("name"),
+            "nama_emiten": fundamental_data.get("nama_emiten"),
             "sektor": fundamental_data.get("sector"),
             "sub_sektor": fundamental_data.get("sub_sector"),
             "periode": quarter,

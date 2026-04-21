@@ -59,13 +59,59 @@ def get_fundamental():
     except Exception:
         summary = "AI summarization is currently unavailable. Please try again later."
 
-    return jsonify(
-        {
-            "status": "success",
-            "symbol": symbol.upper(),
-            "year": year,
-            "quarter": quarter,
-            "fundamental_data": fundamental_data,
-            "ai_summary": summary,
-        }
-    )
+    # Construct the new response format
+    response = {
+        "meta": {
+            "kode_emiten": fundamental_data.get("symbol"),
+            "nama_emiten": fundamental_data.get("name"),
+            "sektor": fundamental_data.get("sector"),
+            "sub_sektor": fundamental_data.get("sub_sector"),
+            "periode": quarter,
+            "tahun": year,
+            "tanggal_laporan": fundamental_data.get("report_date"),
+        },
+        "financials": {
+            "revenue": current_data.get("revenue"),
+            "net_income": current_data.get("net_profit"),
+            "operating_profit": current_data.get("operating_profit"),
+            "operating_expense": current_data.get("operating_expense"),
+            "total_assets": current_data.get("total_assets"),
+            "total_equity": current_data.get("total_equity"),
+            "total_liabilities": current_data.get("total_liabilities"),
+        },
+        "market": {
+            "price": current_data.get("price"),
+            "shares_outstanding": current_data.get("shares_outstanding"),
+            "market_cap": current_data.get("market_cap"),
+        },
+        "ratios": {
+            "profitability": {
+                "roe": current_data.get("roe"),
+                "roa": current_data.get("roa"),
+                "net_margin": current_data.get("npm"),
+            },
+            "leverage": {
+                "debt_to_equity": current_data.get("der"),
+            },
+            "liquidity": {
+                "current_ratio": current_data.get("current_ratio"),
+            },
+            "valuation": {
+                "eps": current_data.get("eps"),
+                "book_value_per_share": current_data.get("book_value_per_share"),
+                "per": current_data.get("per"),
+                "pbr": current_data.get("pbr"),
+            },
+        },
+        "growth": {
+            "revenue_yoy": current_data.get("revenue_yoy"),
+            "net_income_yoy": current_data.get("net_income_yoy"),
+        },
+        "raw_flags": {
+            "has_cogs": current_data.get("has_cogs", False),
+            "has_current_assets": current_data.get("has_current_assets", False),
+        },
+        "ai_summary": summary,
+    }
+
+    return jsonify(response)

@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 from app.scraper import scrape_fundamental
+from app.db import get_fundamental_result, save_fundamental_result
 from utils.ai import summarize_fundamental, extract_financial_metrics
 
 bp = Blueprint("main", __name__)
@@ -44,6 +45,14 @@ def get_fundamental():
 
     if errors:
         return jsonify({"status": "error", "errors": errors}), 400
+
+    try:
+        cached_payload = get_fundamental_result(symbol, year, quarter)
+        if cached_payload:
+            return jsonify(cached_payload)
+    except Exception:
+        # Continue to scrape when database read fails.
+        pass
 
     try:
         fundamental_data = scrape_fundamental(symbol, year, quarter)
@@ -214,5 +223,11 @@ def get_fundamental():
         },
         "ai_summary": summary,
     }
+
+    try:
+        save_fundamental_result(response)
+    except Exception:
+        # Keep API response successful even when database is unavailable.
+        pass
 
     return jsonify(response)

@@ -44,9 +44,15 @@ Edit `.env`:
 
 ```
 OPENAI_API_KEY=sk-your-openai-api-key-here
-FLASK_DEBUG=false
+FLASK_DEBUG=true
+FLASK_RELOAD=true
 FLASK_PORT=5000
 ```
+
+Keterangan:
+
+- `FLASK_DEBUG=true` untuk mode development.
+- `FLASK_RELOAD=true` agar server otomatis restart saat ada perubahan file.
 
 ### 3. Jalankan aplikasi
 
@@ -63,8 +69,9 @@ App akan berjalan di `http://localhost:5000`.
 Health check.
 
 **Response:**
+
 ```json
-{"status": "ok"}
+{ "status": "ok" }
 ```
 
 ---
@@ -75,11 +82,11 @@ Ambil data fundamental saham dan AI summary.
 
 **Request body (JSON):**
 
-| Field    | Type   | Required | Keterangan                   |
-|----------|--------|----------|------------------------------|
-| symbol   | string | ✅        | Kode emiten (e.g. `BBCA`)    |
-| year     | int    | ✅        | Tahun (e.g. `2024`)          |
-| quarter  | string | ✅        | Kuartal: `Q1`,`Q2`,`Q3`,`Q4` |
+| Field   | Type   | Required | Keterangan                   |
+| ------- | ------ | -------- | ---------------------------- |
+| symbol  | string | ✅       | Kode emiten (e.g. `BBCA`)    |
+| year    | int    | ✅       | Tahun (e.g. `2024`)          |
+| quarter | string | ✅       | Kuartal: `Q1`,`Q2`,`Q3`,`Q4` |
 
 **Contoh Request:**
 

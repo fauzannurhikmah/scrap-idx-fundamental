@@ -7,6 +7,13 @@ bp = Blueprint("main", __name__)
 VALID_QUARTERS = {"Q1", "Q2", "Q3", "Q4"}
 
 
+def _pick_first(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
 @bp.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -119,16 +126,50 @@ def get_fundamental():
     except Exception:
         summary = "AI summarization is currently unavailable. Please try again later."
 
-    # RESPONSE (UNCHANGED STRUCTURE)
+    parsed_data = fundamental_data.get("data") or {}
+    raw_data = fundamental_data.get("raw_response") or {}
+    attachments = raw_data.get("Attachments") or []
+    first_attachment = attachments[0] if attachments else {}
+
+    nama_emiten = _pick_first(
+        fundamental_data.get("nama_emiten"),
+        parsed_data.get("nama_emiten"),
+        raw_data.get("NamaEmiten"),
+        first_attachment.get("NamaEmiten"),
+    )
+
+    sektor = _pick_first(
+        fundamental_data.get("sector"),
+        parsed_data.get("sector"),
+        raw_data.get("Sector"),
+        raw_data.get("Sektor"),
+    )
+
+    sub_sektor = _pick_first(
+        fundamental_data.get("sub_sector"),
+        parsed_data.get("sub_sector"),
+        raw_data.get("SubSector"),
+        raw_data.get("Sub_Sector"),
+        raw_data.get("SubSektor"),
+    )
+
+    tanggal_laporan = _pick_first(
+        fundamental_data.get("report_date"),
+        parsed_data.get("tanggal_laporan"),
+        raw_data.get("TanggalLaporan"),
+        raw_data.get("Report_Date"),
+        raw_data.get("File_Modified"),
+    )
+
     response = {
         "meta": {
-            "kode_emiten": fundamental_data.get("symbol"),
-            "nama_emiten": fundamental_data.get("nama_emiten"),
-            "sektor": fundamental_data.get("sector"),
-            "sub_sektor": fundamental_data.get("sub_sector"),
+            "kode_emiten": _pick_first(fundamental_data.get("symbol"), parsed_data.get("kode_emiten")),
+            "nama_emiten": nama_emiten,
+            "sektor": sektor,
+            "sub_sektor": sub_sektor,
             "periode": quarter,
             "tahun": year,
-            "tanggal_laporan": fundamental_data.get("report_date"),
+            "tanggal_laporan": tanggal_laporan,
         },
         "financials": {
             "revenue": current_data.get("revenue"),

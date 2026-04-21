@@ -285,8 +285,10 @@ def parse_financial_data(raw_data: dict) -> dict:
     return {
         "kode_emiten": raw_data.get("KodeEmiten"),
         "nama_emiten": raw_data.get("NamaEmiten"),
-        "periode_laporan": raw_data.get("PeriodeLaporan"),
-        "tanggal_laporan": raw_data.get("TanggalLaporan"),
+        "periode_laporan": raw_data.get("PeriodeLaporan") or raw_data.get("Report_Period"),
+        "tanggal_laporan": raw_data.get("TanggalLaporan") or raw_data.get("Report_Date") or raw_data.get("File_Modified"),
+        "sector": raw_data.get("Sector") or raw_data.get("Sektor"),
+        "sub_sector": raw_data.get("SubSector") or raw_data.get("Sub_Sector") or raw_data.get("SubSektor"),
         "revenue": raw_data.get("Revenue"),
         "cost_of_goods_sold": raw_data.get("CostOfGoodsSold"),
         "gross_profit": raw_data.get("GrossProfit"),
@@ -310,9 +312,10 @@ def parse_financial_data(raw_data: dict) -> dict:
 def scrape_fundamental(symbol: str, year: int, quarter: str) -> dict:
     """Main function to scrape fundamental data from IDX"""
     raw_data = get_financial_report(symbol, year, quarter)
+
     parsed_data = parse_financial_data(raw_data)
     report_text, parsed_documents = _collect_report_text(raw_data)
-    
+
     return {
         "symbol": symbol.upper(),
         "year": year,

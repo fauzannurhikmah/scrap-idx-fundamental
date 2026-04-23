@@ -115,9 +115,9 @@ def init_db() -> None:
         conn.commit()
 
 
-def get_fundamental_result(symbol: str, year: int, quarter: str):
+def get_fundamental_result(symbol: str, year: int, quarter: str | None = None):
     normalized_symbol = _normalize_symbol(symbol)
-    normalized_quarter = _normalize_period(quarter)
+    normalized_quarter = _normalize_period(quarter) or "AUDIT"
 
     with _get_conn() as conn:
         with conn.cursor() as cursor:

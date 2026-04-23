@@ -28,6 +28,7 @@ def get_fundamental():
     symbol = body.get("symbol", "").strip()
     year = body.get("year")
     quarter = str(body.get("quarter", "")).strip().upper()
+    quarter = quarter or None
 
     errors = []
     if not symbol:
@@ -39,16 +40,16 @@ def get_fundamental():
             year = int(year)
         except (ValueError, TypeError):
             errors.append("'year' must be a valid integer")
-    if not quarter:
-        errors.append("'quarter' is required (Q1, Q2, Q3, or Q4)")
-    elif quarter not in VALID_QUARTERS:
+    if quarter and quarter not in VALID_QUARTERS:
         errors.append(f"'quarter' must be one of {sorted(VALID_QUARTERS)}")
 
     if errors:
         return jsonify({"status": "error", "errors": errors}), 400
 
+    request_period = quarter or "AUDIT"
+
     try:
-        cached_payload = get_fundamental_result(symbol, year, quarter)
+        cached_payload = get_fundamental_result(symbol, year, request_period)
         if cached_payload:
             return jsonify(cached_payload)
     except Exception:
@@ -189,7 +190,7 @@ def get_fundamental():
             "nama_emiten": nama_emiten,
             "sektor": sektor,
             "sub_sektor": sub_sektor,
-            "periode": quarter,
+            "periode": request_period,
             "tahun": year,
             "tanggal_laporan": tanggal_laporan,
         },

@@ -236,44 +236,78 @@ def _collect_report_text(raw_data: dict) -> tuple[str, list[dict]]:
 
     return "\n\n".join(text_chunks).strip(), parsed_docs
 
-def get_financial_report(symbol: str, year: int, quarter: str) -> dict:
-    """
-    Get financial report from IDX API
-    
-    Args:
-        symbol: Stock code (e.g., 'BBRI', 'ASII')
-        year: Year of report (e.g., 2024)
-        quarter: Quarter (Q1, Q2, Q3, Q4)
-    
-    Returns:
-        dict: Financial report data
-    """
-    periode = QUARTER_MAP.get(quarter.upper(), "tw1")
-    
+def _normalized_lookup(raw_data: dict) -> dict:
+    lookup = {}
+    for key, value in (raw_data or {}).items():
+        normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+        if normalized and normalized not in lookup:
+            lookup[normalized] = value
+    return lookup
+
+
+def _pick_field(raw_data: dict, *aliases: str):
+    for alias in aliases:
+        if alias in raw_data and raw_data.get(alias) not in (None, ""):
+            return raw_data.get(alias)
+
+    normalized_lookup = _normalized_lookup(raw_data)
+    for alias in aliases:
+        normalized = "".join(ch for ch in str(alias).lower() if ch.isalnum())
+        value = normalized_lookup.get(normalized)
+        if value not in (None, ""):
+            return value
+
+    return None
+
+
+def _fetch_report_results(symbol: str, year: int, periode: str, report_type: str = "rdf") -> list[dict]:
     url = "https://www.idx.co.id/primary/ListedCompany/GetFinancialReport"
-    
     params = {
-        "ReportType": "PDF",
+        "ReportType": report_type,
         "KodeEmiten": symbol.upper(),
         "Year": str(year),
         "SortColumn": "KodeEmiten",
         "SortOrder": "asc",
         "EmitenType": "s",
         "Periode": periode,
-        "indexfrom": 0,
-        "pagesize": 0,
+        "indexfrom": 1,
+        "pagesize": 12,
     }
-    
-    try:
-        response_data = _get(url, params)
-        if response_data.get("ResultCount", 0) > 0 and response_data.get("Results"):
-            return response_data["Results"][0]
 
-        # Fallback for potential API changes in period casing.
-        fallback_params = {**params, "Periode": periode.upper()}
-        fallback_response_data = _get(url, fallback_params)
-        if fallback_response_data.get("ResultCount", 0) > 0 and fallback_response_data.get("Results"):
-            return fallback_response_data["Results"][0]
+    response_data = _get(url, params)
+    return response_data.get("Results") or []
+
+
+def get_financial_report(symbol: str, year: int, quarter: str | None = None) -> dict:
+    """
+    Get financial report from IDX API
+    
+    Args:
+        symbol: Stock code (e.g., 'BBRI', 'ASII')
+        year: Year of report (e.g., 2024)
+        quarter: Quarter (Q1, Q2, Q3, Q4), optional for yearly mode
+    
+    Returns:
+        dict: Financial report data
+    """
+    requested_quarter = (quarter or "").strip().upper()
+    periode = QUARTER_MAP.get(requested_quarter) if requested_quarter else "audit"
+
+    try:
+        # Primary mode from IDX search contract: reportType=rdf and periode by request.
+        results = _fetch_report_results(symbol, year, periode, report_type="rdf")
+        if results:
+            return results[0]
+
+        # Fallback for potential period casing differences.
+        fallback_results = _fetch_report_results(symbol, year, periode.upper(), report_type="rdf")
+        if fallback_results:
+            return fallback_results[0]
+
+        # Compatibility fallback.
+        legacy_results = _fetch_report_results(symbol, year, periode, report_type="PDF")
+        if legacy_results:
+            return legacy_results[0]
 
         raise RuntimeError(f"No financial data found for {symbol} - {year} {periode}")
             
@@ -283,43 +317,44 @@ def get_financial_report(symbol: str, year: int, quarter: str) -> dict:
 def parse_financial_data(raw_data: dict) -> dict:
     """Parse raw IDX API response into standardized format"""
     return {
-        "kode_emiten": raw_data.get("KodeEmiten"),
-        "nama_emiten": raw_data.get("NamaEmiten"),
-        "periode_laporan": raw_data.get("PeriodeLaporan") or raw_data.get("Report_Period"),
-        "tanggal_laporan": raw_data.get("TanggalLaporan") or raw_data.get("Report_Date") or raw_data.get("File_Modified"),
-        "sector": raw_data.get("Sector") or raw_data.get("Sektor"),
-        "sub_sector": raw_data.get("SubSector") or raw_data.get("Sub_Sector") or raw_data.get("SubSektor"),
-        "revenue": raw_data.get("Revenue"),
-        "cost_of_goods_sold": raw_data.get("CostOfGoodsSold"),
-        "gross_profit": raw_data.get("GrossProfit"),
-        "operating_expense": raw_data.get("OperatingExpense"),
-        "operating_profit": raw_data.get("OperatingProfit"),
-        "net_profit": raw_data.get("NetProfit"),
-        "total_assets": raw_data.get("TotalAssets"),
-        "total_liabilities": raw_data.get("TotalLiabilities"),
-        "total_equity": raw_data.get("TotalEquity"),
-        "eps": raw_data.get("EPS"),
-        "book_value_per_share": raw_data.get("BookValuePerShare"),
-        "roe": raw_data.get("ROE"),
-        "roa": raw_data.get("ROA"),
-        "npm": raw_data.get("NPM"),
-        "der": raw_data.get("DER"),
-        "per": raw_data.get("PER"),
-        "pbr": raw_data.get("PBR"),
-        "current_ratio": raw_data.get("CurrentRatio"),
+        "kode_emiten": _pick_field(raw_data, "KodeEmiten", "Code"),
+        "nama_emiten": _pick_field(raw_data, "NamaEmiten", "Name"),
+        "periode_laporan": _pick_field(raw_data, "PeriodeLaporan", "Report_Period", "Period"),
+        "tanggal_laporan": _pick_field(raw_data, "TanggalLaporan", "Report_Date", "File_Modified", "Date"),
+        "sector": _pick_field(raw_data, "Sector", "Sektor"),
+        "sub_sector": _pick_field(raw_data, "SubSector", "Sub_Sector", "SubSektor"),
+        "revenue": _pick_field(raw_data, "Revenue", "TotalRevenue", "Sales"),
+        "cost_of_goods_sold": _pick_field(raw_data, "CostOfGoodsSold", "COGS"),
+        "gross_profit": _pick_field(raw_data, "GrossProfit"),
+        "operating_expense": _pick_field(raw_data, "OperatingExpense", "OperatingExpenses"),
+        "operating_profit": _pick_field(raw_data, "OperatingProfit", "OperatingIncome"),
+        "net_profit": _pick_field(raw_data, "NetProfit", "NetIncome", "ProfitForTheYear", "ProfitLoss"),
+        "total_assets": _pick_field(raw_data, "TotalAssets", "TotalAsset", "Assets"),
+        "total_liabilities": _pick_field(raw_data, "TotalLiabilities", "Liabilities", "TotalLiability"),
+        "total_equity": _pick_field(raw_data, "TotalEquity", "Equity"),
+        "eps": _pick_field(raw_data, "EPS", "EarningPerShare"),
+        "book_value_per_share": _pick_field(raw_data, "BookValuePerShare", "BVPS"),
+        "roe": _pick_field(raw_data, "ROE", "ReturnOnEquity"),
+        "roa": _pick_field(raw_data, "ROA", "ReturnOnAssets"),
+        "npm": _pick_field(raw_data, "NPM", "NetMargin", "NetProfitMargin"),
+        "der": _pick_field(raw_data, "DER", "DebtToEquity"),
+        "per": _pick_field(raw_data, "PER", "PriceEarningsRatio"),
+        "pbr": _pick_field(raw_data, "PBR", "PriceToBookRatio"),
+        "current_ratio": _pick_field(raw_data, "CurrentRatio"),
     }
 
-def scrape_fundamental(symbol: str, year: int, quarter: str) -> dict:
+def scrape_fundamental(symbol: str, year: int, quarter: str | None = None) -> dict:
     """Main function to scrape fundamental data from IDX"""
     raw_data = get_financial_report(symbol, year, quarter)
 
     parsed_data = parse_financial_data(raw_data)
     report_text, parsed_documents = _collect_report_text(raw_data)
+    request_period = (quarter or "").strip().upper() or "AUDIT"
 
     return {
         "symbol": symbol.upper(),
         "year": year,
-        "quarter": quarter.upper(),
+        "quarter": request_period,
         "data": parsed_data,
         "report_text": report_text,
         "report_documents": parsed_documents,

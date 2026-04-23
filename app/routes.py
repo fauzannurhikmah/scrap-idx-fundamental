@@ -1,7 +1,8 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from app.scraper import scrape_fundamental
 from app.db import get_fundamental_result, save_fundamental_result
 from utils.ai import summarize_fundamental, extract_financial_metrics
+from utils.market import fetch_market_snapshot
 
 bp = Blueprint("main", __name__)
 
@@ -62,6 +63,8 @@ def get_fundamental():
             "message": "Failed to retrieve data from IDX. Please try again later."
         }), 502
 
+    market_snapshot = fetch_market_snapshot(symbol)
+
     # EXISTING EXTRACTION 
     try:
         extracted_metrics = extract_financial_metrics(fundamental_data)
@@ -74,6 +77,16 @@ def get_fundamental():
         fundamental_data["data"] = current_data
     except Exception:
         current_data = fundamental_data.get("data") or {}
+
+    for key, value in market_snapshot.items():
+        if value not in (None, ""):
+            current_data[key] = value
+
+    current_app.logger.info(
+        "Market snapshot merged for %s: %s",
+        symbol,
+        market_snapshot,
+    )
 
     #  CALCULATION LAYER (SAFE ADDITION)
     try:

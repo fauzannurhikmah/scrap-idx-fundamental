@@ -157,6 +157,25 @@ def get_fundamental():
     request_period = quarter or "AUDIT"
 
     try:
+        cached_payload = get_fundamental_result(symbol, year, request_period)
+        if cached_payload:
+            current_app.logger.info(
+                "Returning cached fundamental payload from database for %s %s %s",
+                symbol,
+                year,
+                request_period,
+            )
+            return jsonify(cached_payload)
+    except Exception as exc:
+        current_app.logger.warning(
+            "Database lookup failed for %s %s %s, continuing with scrape: %s",
+            symbol,
+            year,
+            request_period,
+            exc,
+        )
+
+    try:
         fundamental_data = scrape_fundamental(symbol, year, quarter)
     except Exception:
         return jsonify({

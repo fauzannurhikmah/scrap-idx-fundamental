@@ -50,7 +50,9 @@ RATIO_FIELDS = {
 
 
 def _build_client() -> OpenAI:
-    return OpenAI(api_key=OPENAI_API_KEY, base_url=BASE_URL_AI)
+    import httpx
+    http_client = httpx.Client(verify=False)
+    return OpenAI(api_key=OPENAI_API_KEY, base_url=BASE_URL_AI, http_client=http_client)
 
 
 def _safe_json_parse(content: str) -> dict:
@@ -275,7 +277,8 @@ def summarize_fundamental(data: dict) -> str:
     core_data = data.get("data") or {}
 
     if not report_text:
-        return "Dokumen laporan tidak tersedia atau gagal diekstrak, jadi AI summary belum bisa dibuat."
+        # No document text available - return early without trying API call
+        return "Dokumen laporan tidak tersedia atau gagal diekstrak. AI summary memerlukan teks dokumen untuk dianalisis."
 
     docs_text = "\n".join(
         [

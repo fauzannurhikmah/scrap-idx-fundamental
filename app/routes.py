@@ -124,48 +124,6 @@ def _normalize_current_data(current_data):
     return normalized
 
 
-def _enrich_cached_payload(payload):
-    if not isinstance(payload, dict):
-        return payload
-
-    financials = payload.get("financials") or {}
-    ratios = payload.get("ratios") or {}
-    leverage = ratios.get("leverage") or {}
-    liquidity = ratios.get("liquidity") or {}
-    profitability = ratios.get("profitability") or {}
-
-    revenue = _to_number(financials.get("revenue"))
-    net_income = _to_number(financials.get("net_income"))
-    operating_expense = _to_number(financials.get("operating_expense"))
-    total_assets = _to_number(financials.get("total_assets"))
-    total_equity = _to_number(financials.get("total_equity"))
-    total_liabilities = _to_number(financials.get("total_liabilities"))
-
-    if financials.get("operating_profit") in (None, "") and revenue is not None and operating_expense is not None:
-        financials["operating_profit"] = revenue - operating_expense
-
-    if leverage.get("debt_to_equity") in (None, "") and total_equity not in (None, 0) and total_liabilities is not None:
-        leverage["debt_to_equity"] = round(total_liabilities / total_equity, 4)
-
-    if profitability.get("roa") in (None, "") and net_income is not None and total_assets not in (None, 0):
-        profitability["roa"] = round((net_income / total_assets) * 100, 2)
-
-    if profitability.get("roe") in (None, "") and net_income is not None and total_equity not in (None, 0):
-        profitability["roe"] = round((net_income / total_equity) * 100, 2)
-
-    current_assets = _to_number(_pick_first(financials.get("current_assets"), financials.get("total_assets")))
-    current_liabilities = _to_number(_pick_first(financials.get("current_liabilities"), financials.get("total_liabilities")))
-    if liquidity.get("current_ratio") in (None, "") and current_liabilities not in (None, 0) and current_assets is not None:
-        liquidity["current_ratio"] = round(current_assets / current_liabilities, 4)
-
-    ratios["leverage"] = leverage
-    ratios["liquidity"] = liquidity
-    ratios["profitability"] = profitability
-    payload["financials"] = financials
-    payload["ratios"] = ratios
-    return payload
-
-
 @bp.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -197,20 +155,6 @@ def get_fundamental():
         return jsonify({"status": "error", "errors": errors}), 400
 
     request_period = quarter or "AUDIT"
-
-    try:
-        cached_payload = get_fundamental_result(symbol, year, request_period)
-        if cached_payload:
-            cached_payload = _enrich_cached_payload(cached_payload)
-            cached_payload = _enrich_growth(cached_payload, symbol, year, quarter)
-            try:
-                save_fundamental_result(cached_payload)
-            except Exception:
-                pass
-            return jsonify(cached_payload)
-    except Exception:
-        # Continue to scrape when database read fails.
-        pass
 
     try:
         fundamental_data = scrape_fundamental(symbol, year, quarter)
@@ -355,10 +299,17 @@ def get_fundamental():
     if current_data:
         fundamental_data["data"] = current_data
 
-    # EXISTING AI SUMMARY (UNCHANGED)
+    # EXISTING AI SUMMARY 
     try:
         summary = summarize_fundamental(fundamental_data)
-    except Exception:
+    except Exception as e:
+        current_app.logger.error(
+            "Failed to generate AI summary for %s %d %s: %s",
+            symbol,
+            year,
+            request_period,
+            str(e),
+        )
         summary = "AI summarization is currently unavailable. Please try again later."
 
     parsed_data = fundamental_data.get("data") or {}

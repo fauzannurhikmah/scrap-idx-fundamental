@@ -1,11 +1,10 @@
-from contextlib import contextmanager
-import json
-from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import logging
 
-import psycopg2
-from psycopg2.extras import Json
-from psycopg2 import sql
+from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, func, inspect, select, text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config.settings import (
     POSTGRES_DB,
@@ -18,27 +17,32 @@ from config.settings import (
 )
 
 
-def _build_dsn() -> str:
+logger = logging.getLogger(__name__)
+
+Base = declarative_base()
+_engine = None
+_session_factory = None
+_schema_initialized = False
+
+
+def _build_database_url():
     if POSTGRES_URL:
         try:
-            parsed = urlsplit(POSTGRES_URL)
-            query_items = parse_qsl(parsed.query, keep_blank_values=True)
-            filtered_items = []
-            for key, value in query_items:
-                if key.lower() == "schema":
-                    continue
-                filtered_items.append((key, value))
-
-            cleaned_query = urlencode(filtered_items)
-            return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, cleaned_query, parsed.fragment))
+            parsed = make_url(POSTGRES_URL)
+            if parsed.query and "schema" in parsed.query:
+                query = dict(parsed.query)
+                query.pop("schema", None)
+                parsed = parsed.set(query=query)
+            return parsed
         except Exception:
             return POSTGRES_URL
-    return (
-        f"host={POSTGRES_HOST} "
-        f"port={POSTGRES_PORT} "
-        f"dbname={POSTGRES_DB} "
-        f"user={POSTGRES_USER} "
-        f"password={POSTGRES_PASSWORD}"
+    return URL.create(
+        "postgresql+psycopg2",
+        username=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        database=POSTGRES_DB,
     )
 
 
@@ -50,163 +54,141 @@ def _normalize_period(period: str) -> str:
     return (period or "").strip().upper()
 
 
-LOCAL_CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache"
-LOCAL_CACHE_FILE = LOCAL_CACHE_DIR / "fundamental_results.json"
+class FundamentalResult(Base):
+    __tablename__ = POSTGRES_TABLE
+    __table_args__ = (UniqueConstraint("kode_emiten", "tahun", "periode", name=f"{POSTGRES_TABLE}_key"),)
+
+    kode_emiten = Column(Text, primary_key=True, index=True)
+    tahun = Column(Integer, primary_key=True, index=True)
+    periode = Column(Text, primary_key=True, index=True)
+    meta = Column(JSONB, nullable=False, default=dict)
+    financials = Column(JSONB, nullable=False, default=dict)
+    market = Column(JSONB, nullable=False, default=dict)
+    ratios = Column(JSONB, nullable=False, default=dict)
+    growth = Column(JSONB, nullable=False, default=dict)
+    raw_flags = Column(JSONB, nullable=False, default=dict)
+    ai_summary = Column(Text, nullable=True)
+    payload = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
-def _cache_key(symbol: str, year: int, period: str) -> str:
-    return f"{_normalize_symbol(symbol)}|{int(year)}|{_normalize_period(period) or 'AUDIT'}"
+def _get_engine():
+    global _engine, _session_factory
+
+    if _engine is None:
+        database_url = _build_database_url()
+        _engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        _session_factory = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+
+    return _engine
 
 
-def _load_local_cache() -> dict:
-    try:
-        if not LOCAL_CACHE_FILE.exists():
-            return {}
-        with LOCAL_CACHE_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+def _get_session_factory():
+    if _session_factory is None:
+        _get_engine()
+    return _session_factory
 
 
-def _save_local_cache(cache_data: dict) -> None:
-    LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCAL_CACHE_FILE.open("w", encoding="utf-8") as f:
-        json.dump(cache_data, f, ensure_ascii=False)
+def _ensure_schema() -> None:
+    global _schema_initialized
 
-
-def _get_local_cached_payload(symbol: str, year: int, quarter: str) -> dict | None:
-    cache_data = _load_local_cache()
-    return cache_data.get(_cache_key(symbol, year, quarter))
-
-
-def _save_local_cached_payload(payload: dict) -> None:
-    meta = payload.get("meta") or {}
-    symbol = _normalize_symbol(meta.get("kode_emiten"))
-    year = meta.get("tahun")
-    period = _normalize_period(meta.get("periode")) or "AUDIT"
-
-    if not symbol or year in (None, ""):
+    if _schema_initialized:
         return
 
-    try:
-        year = int(year)
-    except (TypeError, ValueError):
+    engine = _get_engine()
+    Base.metadata.create_all(engine)
+
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    if POSTGRES_TABLE not in existing_tables:
+        _schema_initialized = True
         return
 
-    cache_data = _load_local_cache()
-    cache_data[_cache_key(symbol, year, period)] = payload
-    _save_local_cache(cache_data)
+    existing_columns = {column["name"] for column in inspector.get_columns(POSTGRES_TABLE)}
+    required_columns = {
+        "kode_emiten": "TEXT",
+        "tahun": "INTEGER",
+        "periode": "TEXT",
+        "meta": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "financials": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "market": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "ratios": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "growth": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "raw_flags": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "ai_summary": "TEXT",
+        "payload": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    }
 
+    with engine.begin() as conn:
+        for column_name, ddl in required_columns.items():
+            if column_name not in existing_columns:
+                conn.execute(
+                    text(
+                        f'ALTER TABLE "{POSTGRES_TABLE}" ADD COLUMN IF NOT EXISTS "{column_name}" {ddl}'
+                    )
+                )
 
-@contextmanager
-def _get_conn():
-    conn = psycopg2.connect(_build_dsn())
-    try:
-        yield conn
-    finally:
-        conn.close()
+        try:
+            conn.execute(
+                text(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS "{POSTGRES_TABLE}_key" ON "{POSTGRES_TABLE}" (kode_emiten, tahun, periode)'
+                )
+            )
+        except Exception:
+            logger.exception("Failed to ensure unique index for %s", POSTGRES_TABLE)
+
+    _schema_initialized = True
 
 
 def init_db() -> None:
-    with _get_conn() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                sql.SQL(
-                    """
-                    CREATE TABLE IF NOT EXISTS {} (
-                        id BIGSERIAL PRIMARY KEY,
-                        kode_emiten TEXT,
-                        tahun INTEGER,
-                        periode TEXT,
-                        meta JSONB NOT NULL,
-                        financials JSONB NOT NULL,
-                        market JSONB NOT NULL,
-                        ratios JSONB NOT NULL,
-                        growth JSONB NOT NULL,
-                        raw_flags JSONB NOT NULL,
-                        ai_summary TEXT,
-                        payload JSONB NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS financials JSONB NOT NULL DEFAULT '{}'::jsonb;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS market JSONB NOT NULL DEFAULT '{}'::jsonb;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS ratios JSONB NOT NULL DEFAULT '{}'::jsonb;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS growth JSONB NOT NULL DEFAULT '{}'::jsonb;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS raw_flags JSONB NOT NULL DEFAULT '{}'::jsonb;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS ai_summary TEXT;"
-                ).format(sql.Identifier(POSTGRES_TABLE))
-            )
-            cursor.execute(
-                sql.SQL(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (kode_emiten, tahun, periode);"
-                ).format(
-                    sql.Identifier(f"{POSTGRES_TABLE}_key"),
-                    sql.Identifier(POSTGRES_TABLE),
-                )
-            )
-        conn.commit()
+    _ensure_schema()
 
 
 def get_fundamental_result(symbol: str, year: int, quarter: str | None = None):
     normalized_symbol = _normalize_symbol(symbol)
     normalized_quarter = _normalize_period(quarter) or "AUDIT"
 
-    row = None
     try:
-        with _get_conn() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    sql.SQL(
-                        """
-                        SELECT payload, meta, financials, market, ratios, growth, raw_flags, ai_summary
-                        FROM {}
-                        WHERE kode_emiten = %s AND tahun = %s AND periode = %s
-                        LIMIT 1;
-                        """
-                    ).format(sql.Identifier(POSTGRES_TABLE)),
-                    (normalized_symbol, year, normalized_quarter),
+        _ensure_schema()
+        session_factory = _get_session_factory()
+        with session_factory() as session:
+            row = session.execute(
+                select(
+                    FundamentalResult.payload,
+                    FundamentalResult.meta,
+                    FundamentalResult.financials,
+                    FundamentalResult.market,
+                    FundamentalResult.ratios,
+                    FundamentalResult.growth,
+                    FundamentalResult.raw_flags,
+                    FundamentalResult.ai_summary,
+                ).where(
+                    FundamentalResult.kode_emiten == normalized_symbol,
+                    FundamentalResult.tahun == year,
+                    FundamentalResult.periode == normalized_quarter,
                 )
-                row = cursor.fetchone()
+            ).first()
     except Exception:
-        row = None
+        logger.exception(
+            "Failed to load fundamental result from database: %s %s %s",
+            normalized_symbol,
+            year,
+            normalized_quarter,
+        )
+        return None
 
     if not row:
-        return _get_local_cached_payload(normalized_symbol, year, normalized_quarter)
+        return None
 
     payload, meta, financials, market, ratios, growth, raw_flags, ai_summary = row
     if payload:
+        logger.info(
+            "Loaded fundamental result from database: %s %s %s",
+            normalized_symbol,
+            year,
+            normalized_quarter,
+        )
         return payload
 
     return {
@@ -232,43 +214,81 @@ def save_fundamental_result(payload: dict) -> None:
     kode_emiten = _normalize_symbol(meta.get("kode_emiten"))
     periode = _normalize_period(meta.get("periode"))
 
-    try:
-        with _get_conn() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    sql.SQL(
-                        """
-                        INSERT INTO {} (
-                            kode_emiten, tahun, periode, meta, financials, market, ratios, growth, raw_flags, ai_summary, payload
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (kode_emiten, tahun, periode)
-                        DO UPDATE SET
-                            meta = EXCLUDED.meta,
-                            financials = EXCLUDED.financials,
-                            market = EXCLUDED.market,
-                            ratios = EXCLUDED.ratios,
-                            growth = EXCLUDED.growth,
-                            raw_flags = EXCLUDED.raw_flags,
-                            ai_summary = EXCLUDED.ai_summary,
-                            payload = EXCLUDED.payload;
-                        """
-                    ).format(sql.Identifier(POSTGRES_TABLE)),
-                    (
-                        kode_emiten,
-                        meta.get("tahun"),
-                        periode,
-                        Json(meta),
-                        Json(financials),
-                        Json(market),
-                        Json(ratios),
-                        Json(growth),
-                        Json(raw_flags),
-                        ai_summary,
-                        Json(payload),
-                    ),
-                )
-            conn.commit()
-    except Exception:
-        pass
+    if not kode_emiten or meta.get("tahun") in (None, ""):
+        logger.warning(
+            "Skipping database save because primary key fields are missing: %s %s %s",
+            kode_emiten or "UNKNOWN",
+            meta.get("tahun"),
+            periode or "AUDIT",
+        )
+        return
 
-    _save_local_cached_payload(payload)
+    try:
+        tahun = int(meta.get("tahun"))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Skipping database save because year is invalid: %s %s %s",
+            kode_emiten or "UNKNOWN",
+            meta.get("tahun"),
+            periode or "AUDIT",
+        )
+        return
+
+    try:
+        _ensure_schema()
+        session_factory = _get_session_factory()
+        with session_factory() as session:
+            existing = session.execute(
+                select(FundamentalResult).where(
+                    FundamentalResult.kode_emiten == kode_emiten,
+                    FundamentalResult.tahun == tahun,
+                    FundamentalResult.periode == periode,
+                )
+            ).scalar_one_or_none()
+
+            if existing is None:
+                existing = FundamentalResult(
+                    kode_emiten=kode_emiten,
+                    tahun=tahun,
+                    periode=periode,
+                    meta=meta,
+                    financials=financials,
+                    market=market,
+                    ratios=ratios,
+                    growth=growth,
+                    raw_flags=raw_flags,
+                    ai_summary=ai_summary,
+                    payload=payload,
+                )
+                session.add(existing)
+            else:
+                existing.meta = meta
+                existing.financials = financials
+                existing.market = market
+                existing.ratios = ratios
+                existing.growth = growth
+                existing.raw_flags = raw_flags
+                existing.ai_summary = ai_summary
+                existing.payload = payload
+
+            session.commit()
+        logger.info(
+            "Saved fundamental result to database: %s %s %s",
+            kode_emiten or "UNKNOWN",
+            tahun,
+            periode or "AUDIT",
+        )
+    except SQLAlchemyError:
+        logger.exception(
+            "Failed to save fundamental result to database: %s %s %s",
+            kode_emiten or "UNKNOWN",
+            tahun,
+            periode or "AUDIT",
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected error while saving fundamental result: %s %s %s",
+            kode_emiten or "UNKNOWN",
+            tahun,
+            periode or "AUDIT",
+        )

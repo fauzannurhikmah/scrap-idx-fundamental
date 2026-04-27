@@ -1,4 +1,7 @@
 from contextlib import contextmanager
+import json
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psycopg2
 from psycopg2.extras import Json
@@ -17,7 +20,19 @@ from config.settings import (
 
 def _build_dsn() -> str:
     if POSTGRES_URL:
-        return POSTGRES_URL
+        try:
+            parsed = urlsplit(POSTGRES_URL)
+            query_items = parse_qsl(parsed.query, keep_blank_values=True)
+            filtered_items = []
+            for key, value in query_items:
+                if key.lower() == "schema":
+                    continue
+                filtered_items.append((key, value))
+
+            cleaned_query = urlencode(filtered_items)
+            return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, cleaned_query, parsed.fragment))
+        except Exception:
+            return POSTGRES_URL
     return (
         f"host={POSTGRES_HOST} "
         f"port={POSTGRES_PORT} "
@@ -33,6 +48,55 @@ def _normalize_symbol(symbol: str) -> str:
 
 def _normalize_period(period: str) -> str:
     return (period or "").strip().upper()
+
+
+LOCAL_CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache"
+LOCAL_CACHE_FILE = LOCAL_CACHE_DIR / "fundamental_results.json"
+
+
+def _cache_key(symbol: str, year: int, period: str) -> str:
+    return f"{_normalize_symbol(symbol)}|{int(year)}|{_normalize_period(period) or 'AUDIT'}"
+
+
+def _load_local_cache() -> dict:
+    try:
+        if not LOCAL_CACHE_FILE.exists():
+            return {}
+        with LOCAL_CACHE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_local_cache(cache_data: dict) -> None:
+    LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCAL_CACHE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+
+
+def _get_local_cached_payload(symbol: str, year: int, quarter: str) -> dict | None:
+    cache_data = _load_local_cache()
+    return cache_data.get(_cache_key(symbol, year, quarter))
+
+
+def _save_local_cached_payload(payload: dict) -> None:
+    meta = payload.get("meta") or {}
+    symbol = _normalize_symbol(meta.get("kode_emiten"))
+    year = meta.get("tahun")
+    period = _normalize_period(meta.get("periode")) or "AUDIT"
+
+    if not symbol or year in (None, ""):
+        return
+
+    try:
+        year = int(year)
+    except (TypeError, ValueError):
+        return
+
+    cache_data = _load_local_cache()
+    cache_data[_cache_key(symbol, year, period)] = payload
+    _save_local_cache(cache_data)
 
 
 @contextmanager
@@ -119,23 +183,27 @@ def get_fundamental_result(symbol: str, year: int, quarter: str | None = None):
     normalized_symbol = _normalize_symbol(symbol)
     normalized_quarter = _normalize_period(quarter) or "AUDIT"
 
-    with _get_conn() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                sql.SQL(
-                    """
-                    SELECT payload, meta, financials, market, ratios, growth, raw_flags, ai_summary
-                    FROM {}
-                    WHERE kode_emiten = %s AND tahun = %s AND periode = %s
-                    LIMIT 1;
-                    """
-                ).format(sql.Identifier(POSTGRES_TABLE)),
-                (normalized_symbol, year, normalized_quarter),
-            )
-            row = cursor.fetchone()
+    row = None
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT payload, meta, financials, market, ratios, growth, raw_flags, ai_summary
+                        FROM {}
+                        WHERE kode_emiten = %s AND tahun = %s AND periode = %s
+                        LIMIT 1;
+                        """
+                    ).format(sql.Identifier(POSTGRES_TABLE)),
+                    (normalized_symbol, year, normalized_quarter),
+                )
+                row = cursor.fetchone()
+    except Exception:
+        row = None
 
     if not row:
-        return None
+        return _get_local_cached_payload(normalized_symbol, year, normalized_quarter)
 
     payload, meta, financials, market, ratios, growth, raw_flags, ai_summary = row
     if payload:
@@ -164,38 +232,43 @@ def save_fundamental_result(payload: dict) -> None:
     kode_emiten = _normalize_symbol(meta.get("kode_emiten"))
     periode = _normalize_period(meta.get("periode"))
 
-    with _get_conn() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                sql.SQL(
-                    """
-                    INSERT INTO {} (
-                        kode_emiten, tahun, periode, meta, financials, market, ratios, growth, raw_flags, ai_summary, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (kode_emiten, tahun, periode)
-                    DO UPDATE SET
-                        meta = EXCLUDED.meta,
-                        financials = EXCLUDED.financials,
-                        market = EXCLUDED.market,
-                        ratios = EXCLUDED.ratios,
-                        growth = EXCLUDED.growth,
-                        raw_flags = EXCLUDED.raw_flags,
-                        ai_summary = EXCLUDED.ai_summary,
-                        payload = EXCLUDED.payload;
-                    """
-                ).format(sql.Identifier(POSTGRES_TABLE)),
-                (
-                    kode_emiten,
-                    meta.get("tahun"),
-                    periode,
-                    Json(meta),
-                    Json(financials),
-                    Json(market),
-                    Json(ratios),
-                    Json(growth),
-                    Json(raw_flags),
-                    ai_summary,
-                    Json(payload),
-                ),
-            )
-        conn.commit()
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        INSERT INTO {} (
+                            kode_emiten, tahun, periode, meta, financials, market, ratios, growth, raw_flags, ai_summary, payload
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (kode_emiten, tahun, periode)
+                        DO UPDATE SET
+                            meta = EXCLUDED.meta,
+                            financials = EXCLUDED.financials,
+                            market = EXCLUDED.market,
+                            ratios = EXCLUDED.ratios,
+                            growth = EXCLUDED.growth,
+                            raw_flags = EXCLUDED.raw_flags,
+                            ai_summary = EXCLUDED.ai_summary,
+                            payload = EXCLUDED.payload;
+                        """
+                    ).format(sql.Identifier(POSTGRES_TABLE)),
+                    (
+                        kode_emiten,
+                        meta.get("tahun"),
+                        periode,
+                        Json(meta),
+                        Json(financials),
+                        Json(market),
+                        Json(ratios),
+                        Json(growth),
+                        Json(raw_flags),
+                        ai_summary,
+                        Json(payload),
+                    ),
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+    _save_local_cached_payload(payload)

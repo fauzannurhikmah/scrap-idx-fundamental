@@ -1,5 +1,6 @@
 import requests
 import cloudscraper
+import re
 from io import BytesIO
 from pypdf import PdfReader
 from openpyxl import load_workbook
@@ -45,23 +46,32 @@ LOW_PRIORITY_KEYWORDS = [
 ]
 
 FINANCIAL_TEXT_KEYWORDS = [
+    "jumlah aset",
+    "total assets",
+    "jumlah liabilitas",
+    "total liabilities",
+    "jumlah ekuitas",
+    "total equity",
     "pendapatan",
     "revenue",
-    "laba",
-    "net profit",
+    "laba operasional",
     "operating profit",
-    "aset",
-    "asset",
-    "liabilitas",
-    "equity",
-    "ekuitas",
-    "eps",
-    "roe",
-    "roa",
-    "der",
+    "laba bersih",
+    "net profit",
+    "laba tahun berjalan",
+    "profit for the period",
+    "beban operasional",
+    "operating expense",
+    "net interest income",
     "current ratio",
-    "arus kas",
+    "debt to equity",
+    "return on assets",
+    "return on equity",
+    "eps",
+    "book value per share",
 ]
+
+NUMERIC_ROW_RE = re.compile(r"\d[\d,\.]*")
 
 
 def _create_scraper():
@@ -159,7 +169,10 @@ def _focus_financial_text(raw_text: str) -> str:
     selected_indexes = set()
     for i, line in enumerate(lines):
         lower_line = line.lower()
-        if any(keyword in lower_line for keyword in FINANCIAL_TEXT_KEYWORDS):
+        has_metric_keyword = any(keyword in lower_line for keyword in FINANCIAL_TEXT_KEYWORDS)
+        has_numeric_value = bool(NUMERIC_ROW_RE.search(line))
+
+        if has_metric_keyword and has_numeric_value:
             selected_indexes.add(i)
             if i - 1 >= 0:
                 selected_indexes.add(i - 1)
@@ -167,10 +180,10 @@ def _focus_financial_text(raw_text: str) -> str:
                 selected_indexes.add(i + 1)
 
     if not selected_indexes:
-        return "\n".join(lines[:200])
+        return "\n".join(lines[:140])
 
     focused_lines = [lines[i] for i in sorted(selected_indexes)]
-    return "\n".join(focused_lines)
+    return "\n".join(focused_lines[:220])
 
 
 def _collect_report_text(raw_data: dict) -> tuple[str, list[dict]]:

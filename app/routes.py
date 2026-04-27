@@ -16,6 +16,156 @@ def _pick_first(*values):
     return None
 
 
+def _to_number(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        try:
+            return float(cleaned)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _pick_metric(payload, *field_names):
+    if not isinstance(payload, dict):
+        return None
+
+    for container_name in ("financials", "data", "raw_response"):
+        container = payload.get(container_name) or {}
+        if not isinstance(container, dict):
+            continue
+
+        for field_name in field_names:
+            value = container.get(field_name)
+            if value not in (None, ""):
+                return value
+
+    return None
+
+
+def _calculate_yoy(current_value, previous_value):
+    current_number = _to_number(current_value)
+    previous_number = _to_number(previous_value)
+
+    if current_number is None or previous_number in (None, 0):
+        return None
+
+    try:
+        return round(((current_number - previous_number) / previous_number) * 100, 2)
+    except Exception:
+        return None
+
+
+def _load_previous_period_fundamental(symbol, year, quarter):
+    previous_year = year - 1
+    request_period = quarter or "AUDIT"
+
+    try:
+        cached_previous = get_fundamental_result(symbol, previous_year, request_period)
+        if cached_previous:
+            return cached_previous
+    except Exception:
+        pass
+
+    try:
+        return scrape_fundamental(symbol, previous_year, quarter)
+    except Exception:
+        return None
+
+
+def _enrich_growth(payload, symbol, year, quarter):
+    if not isinstance(payload, dict):
+        return payload
+
+    growth = payload.get("growth") or {}
+    if not isinstance(growth, dict):
+        growth = {}
+
+    needs_revenue = growth.get("revenue_yoy") in (None, "")
+    needs_net_income = growth.get("net_income_yoy") in (None, "")
+
+    if not (needs_revenue or needs_net_income):
+        payload["growth"] = growth
+        return payload
+
+    previous_payload = _load_previous_period_fundamental(symbol, year, quarter)
+    if not previous_payload:
+        payload["growth"] = growth
+        return payload
+
+    current_revenue = _pick_metric(payload, "revenue", "Revenue", "TotalRevenue", "Sales")
+    current_net_income = _pick_metric(payload, "net_income", "net_profit", "NetProfit", "ProfitForTheYear", "ProfitLoss")
+    previous_revenue = _pick_metric(previous_payload, "revenue", "Revenue", "TotalRevenue", "Sales")
+    previous_net_income = _pick_metric(previous_payload, "net_income", "net_profit", "NetProfit", "ProfitForTheYear", "ProfitLoss")
+
+    if needs_revenue:
+        growth["revenue_yoy"] = _calculate_yoy(current_revenue, previous_revenue)
+    if needs_net_income:
+        growth["net_income_yoy"] = _calculate_yoy(current_net_income, previous_net_income)
+
+    payload["growth"] = growth
+    return payload
+
+
+def _normalize_current_data(current_data):
+    if not isinstance(current_data, dict):
+        return {}
+
+    normalized = dict(current_data)
+    normalized["net_income"] = _pick_first(normalized.get("net_income"), normalized.get("net_profit"))
+    normalized["operating_profit"] = _pick_first(normalized.get("operating_profit"), normalized.get("OperatingProfit"), normalized.get("OperatingIncome"))
+    normalized["operating_expense"] = _pick_first(normalized.get("operating_expense"), normalized.get("OperatingExpense"), normalized.get("OperatingExpenses"))
+    return normalized
+
+
+def _enrich_cached_payload(payload):
+    if not isinstance(payload, dict):
+        return payload
+
+    financials = payload.get("financials") or {}
+    ratios = payload.get("ratios") or {}
+    leverage = ratios.get("leverage") or {}
+    liquidity = ratios.get("liquidity") or {}
+    profitability = ratios.get("profitability") or {}
+
+    revenue = _to_number(financials.get("revenue"))
+    net_income = _to_number(financials.get("net_income"))
+    operating_expense = _to_number(financials.get("operating_expense"))
+    total_assets = _to_number(financials.get("total_assets"))
+    total_equity = _to_number(financials.get("total_equity"))
+    total_liabilities = _to_number(financials.get("total_liabilities"))
+
+    if financials.get("operating_profit") in (None, "") and revenue is not None and operating_expense is not None:
+        financials["operating_profit"] = revenue - operating_expense
+
+    if leverage.get("debt_to_equity") in (None, "") and total_equity not in (None, 0) and total_liabilities is not None:
+        leverage["debt_to_equity"] = round(total_liabilities / total_equity, 4)
+
+    if profitability.get("roa") in (None, "") and net_income is not None and total_assets not in (None, 0):
+        profitability["roa"] = round((net_income / total_assets) * 100, 2)
+
+    if profitability.get("roe") in (None, "") and net_income is not None and total_equity not in (None, 0):
+        profitability["roe"] = round((net_income / total_equity) * 100, 2)
+
+    current_assets = _to_number(_pick_first(financials.get("current_assets"), financials.get("total_assets")))
+    current_liabilities = _to_number(_pick_first(financials.get("current_liabilities"), financials.get("total_liabilities")))
+    if liquidity.get("current_ratio") in (None, "") and current_liabilities not in (None, 0) and current_assets is not None:
+        liquidity["current_ratio"] = round(current_assets / current_liabilities, 4)
+
+    ratios["leverage"] = leverage
+    ratios["liquidity"] = liquidity
+    ratios["profitability"] = profitability
+    payload["financials"] = financials
+    payload["ratios"] = ratios
+    return payload
+
+
 @bp.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -51,6 +201,12 @@ def get_fundamental():
     try:
         cached_payload = get_fundamental_result(symbol, year, request_period)
         if cached_payload:
+            cached_payload = _enrich_cached_payload(cached_payload)
+            cached_payload = _enrich_growth(cached_payload, symbol, year, quarter)
+            try:
+                save_fundamental_result(cached_payload)
+            except Exception:
+                pass
             return jsonify(cached_payload)
     except Exception:
         # Continue to scrape when database read fails.
@@ -95,6 +251,7 @@ def get_fundamental():
         net_income = current_data.get("net_profit")
         total_assets = current_data.get("total_assets")
         total_equity = current_data.get("total_equity")
+        total_liabilities = current_data.get("total_liabilities")
         shares = current_data.get("shares_outstanding")
         price = current_data.get("price")
 
@@ -109,6 +266,56 @@ def get_fundamental():
         if current_data.get("total_liabilities") in (None, "") and total_assets and total_equity:
             try:
                 current_data["total_liabilities"] = total_assets - total_equity
+            except Exception:
+                pass
+
+        # Operating Profit (fallback): Operating Profit = Revenue - Operating Expense
+        if current_data.get("operating_profit") in (None, ""):
+            try:
+                revenue_value = _to_number(revenue)
+                operating_expense_value = _to_number(current_data.get("operating_expense"))
+                if revenue_value is not None and operating_expense_value is not None:
+                    current_data["operating_profit"] = revenue_value - operating_expense_value
+            except Exception:
+                pass
+
+        # Current Ratio (fallback): Current Assets / Current Liabilities
+        if current_data.get("current_ratio") in (None, ""):
+            try:
+                current_assets = _to_number(_pick_first(current_data.get("current_assets"), total_assets))
+                current_liabilities = _to_number(_pick_first(current_data.get("current_liabilities"), total_liabilities))
+                if current_liabilities not in (None, 0) and current_assets is not None:
+                    current_data["current_ratio"] = round(current_assets / current_liabilities, 4)
+            except Exception:
+                pass
+
+        # DER (fallback): Total Liabilities / Total Equity
+        if current_data.get("der") in (None, ""):
+            try:
+                liabilities_value = _to_number(_pick_first(current_data.get("total_liabilities"), total_liabilities))
+                equity_value = _to_number(total_equity)
+                if liabilities_value is not None and equity_value not in (None, 0):
+                    current_data["der"] = round(liabilities_value / equity_value, 4)
+            except Exception:
+                pass
+
+        # ROA fallback
+        if current_data.get("roa") in (None, ""):
+            try:
+                net_income_value = _to_number(net_income)
+                assets_value = _to_number(total_assets)
+                if net_income_value is not None and assets_value not in (None, 0):
+                    current_data["roa"] = round((net_income_value / assets_value) * 100, 2)
+            except Exception:
+                pass
+
+        # ROE fallback
+        if current_data.get("roe") in (None, ""):
+            try:
+                net_income_value = _to_number(net_income)
+                equity_value = _to_number(total_equity)
+                if net_income_value is not None and equity_value not in (None, 0):
+                    current_data["roe"] = round((net_income_value / equity_value) * 100, 2)
             except Exception:
                 pass
 
@@ -142,6 +349,11 @@ def get_fundamental():
 
     except Exception:
         pass
+
+    fundamental_data = _enrich_growth(fundamental_data, symbol, year, quarter)
+    current_data = _normalize_current_data(fundamental_data.get("data") or {})
+    if current_data:
+        fundamental_data["data"] = current_data
 
     # EXISTING AI SUMMARY (UNCHANGED)
     try:
@@ -196,7 +408,7 @@ def get_fundamental():
         },
         "financials": {
             "revenue": current_data.get("revenue"),
-            "net_income": current_data.get("net_profit"),
+            "net_income": _pick_first(current_data.get("net_income"), current_data.get("net_profit")),
             "operating_profit": current_data.get("operating_profit"),
             "operating_expense": current_data.get("operating_expense"),
             "total_assets": current_data.get("total_assets"),
@@ -228,8 +440,8 @@ def get_fundamental():
             },
         },
         "growth": {
-            "revenue_yoy": current_data.get("revenue_yoy"),
-            "net_income_yoy": current_data.get("net_income_yoy"),
+            "revenue_yoy": (fundamental_data.get("growth") or {}).get("revenue_yoy"),
+            "net_income_yoy": (fundamental_data.get("growth") or {}).get("net_income_yoy"),
         },
         "raw_flags": {
             "has_cogs": current_data.get("has_cogs", False),

@@ -87,10 +87,22 @@ def _to_number(value: str):
     if not cleaned or cleaned in {"-", ".", ","}:
         return None
 
+    # Normalize thousand/decimal separators across formats:
+    # - 28,032,494 -> 28032494
+    # - 1.533.763.445 -> 1533763445
+    # - 1,23 or 1.23 stays decimal
     if "," in cleaned and "." in cleaned:
         cleaned = cleaned.replace(".", "").replace(",", ".")
-    else:
-        cleaned = cleaned.replace(",", ".")
+    elif cleaned.count(",") > 1 and "." not in cleaned:
+        cleaned = cleaned.replace(",", "")
+    elif cleaned.count(".") > 1 and "," not in cleaned:
+        cleaned = cleaned.replace(".", "")
+    elif "," in cleaned:
+        tail = cleaned.split(",")[-1]
+        if len(tail) == 3 and cleaned.replace(",", "").isdigit():
+            cleaned = cleaned.replace(",", "")
+        else:
+            cleaned = cleaned.replace(",", ".")
 
     try:
         number = float(cleaned)
@@ -127,13 +139,14 @@ def _regex_extract_metric(report_text: str, patterns: list[str]):
 
 def _extract_metrics_by_regex(report_text: str) -> dict:
     return {
-        "revenue": _regex_extract_metric(report_text, [r"\bpendapatan\b", r"\brevenue\b"]),
+        "revenue": _regex_extract_metric(report_text, [r"\bpendapatan\b", r"\brevenue\b", r"\bincome\b"]),
         "gross_profit": _regex_extract_metric(report_text, [r"\blaba kotor\b", r"\bgross profit\b"]),
-        "operating_profit": _regex_extract_metric(report_text, [r"\blaba operasional\b", r"\boperating profit\b"]),
-        "net_profit": _regex_extract_metric(report_text, [r"\blaba bersih\b", r"\bnet profit\b"]),
-        "total_assets": _regex_extract_metric(report_text, [r"\btotal aset\b", r"\btotal assets\b"]),
-        "total_liabilities": _regex_extract_metric(report_text, [r"\btotal liabilitas\b", r"\btotal liabilities\b"]),
-        "total_equity": _regex_extract_metric(report_text, [r"\btotal ekuitas\b", r"\btotal equity\b"]),
+        "operating_expense": _regex_extract_metric(report_text, [r"\bbeban operasional\b", r"\boperating expense\b", r"\boperating expenses\b"]),
+        "operating_profit": _regex_extract_metric(report_text, [r"\blaba operasional\b", r"\boperating profit\b", r"\boperating income\b"]),
+        "net_profit": _regex_extract_metric(report_text, [r"\blaba bersih\b", r"\bnet profit\b", r"\bprofit for the period\b", r"\bprofit loss\b"]),
+        "total_assets": _regex_extract_metric(report_text, [r"\bjumlah aset\b", r"\btotal aset\b", r"\btotal assets\b"]),
+        "total_liabilities": _regex_extract_metric(report_text, [r"\bjumlah liabilitas\b", r"\btotal liabilitas\b", r"\btotal liabilities\b"]),
+        "total_equity": _regex_extract_metric(report_text, [r"\bjumlah ekuitas\b", r"\btotal ekuitas\b", r"\btotal equity\b"]),
         "eps": _regex_extract_metric(report_text, [r"\beps\b", r"\bearing per share\b"]),
         "roe": _regex_extract_metric(report_text, [r"\broe\b", r"\breturn on equity\b"]),
         "roa": _regex_extract_metric(report_text, [r"\broa\b", r"\breturn on assets\b"]),
@@ -142,8 +155,7 @@ def _extract_metrics_by_regex(report_text: str) -> dict:
         "npm": _regex_extract_metric(report_text, [r"\bnpm\b", r"\bnet profit margin\b"]),
         "per": _regex_extract_metric(report_text, [r"\bper\b", r"\bprice earnings ratio\b"]),
         "pbr": _regex_extract_metric(report_text, [r"\bpbr\b", r"\bprice to book\b"]),
-        "cost_of_goods_sold": None,
-        "operating_expense": None,
+        "cost_of_goods_sold": _regex_extract_metric(report_text, [r"\bbeban pokok\b", r"\bcost of goods sold\b", r"\bcogs\b"]),
         "book_value_per_share": None,
     }
 
@@ -180,12 +192,15 @@ def _sanitize_extracted_metrics(metrics: dict) -> dict:
 
 
 def extract_financial_metrics(data: dict) -> dict:
-    if not OPENAI_API_KEY:
-        return {}
-
     report_text = (data.get("report_text") or "").strip()
     if not report_text:
         return {}
+
+    # Deterministic baseline first to improve consistency between requests.
+    baseline = _sanitize_extracted_metrics(_extract_metrics_by_regex(report_text))
+
+    if not OPENAI_API_KEY:
+        return baseline
 
     symbol = data.get("symbol", "")
     year = data.get("year", "")
@@ -207,37 +222,43 @@ Isi dokumen:
 {trimmed_text}
 """.strip()
 
-    client = _build_client()
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Kamu adalah analis keuangan yang mengekstrak angka dari dokumen. "
-                    "Jawab strict JSON object saja."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        max_tokens=600,
-        response_format={"type": "json_object"},
-    )
+    try:
+        client = _build_client()
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Kamu adalah analis keuangan yang mengekstrak angka dari dokumen. "
+                        "Jawab strict JSON object saja."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=600,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        return baseline
 
     content = response.choices[0].message.content or ""
     parsed = _safe_json_parse(content)
 
-    cleaned = {}
+    ai_cleaned = {}
     for field in FINANCIAL_FIELDS:
-        cleaned[field] = parsed.get(field)
+        ai_cleaned[field] = parsed.get(field)
 
-    if not any(value not in (None, "") for value in cleaned.values()):
-        cleaned = _extract_metrics_by_regex(report_text)
+    ai_cleaned = _sanitize_extracted_metrics(ai_cleaned)
 
-    cleaned = _sanitize_extracted_metrics(cleaned)
+    merged = {}
+    for field in FINANCIAL_FIELDS:
+        merged[field] = baseline.get(field)
+        if merged[field] in (None, "") and ai_cleaned.get(field) not in (None, ""):
+            merged[field] = ai_cleaned.get(field)
 
-    return cleaned
+    return merged
 
 
 def summarize_fundamental(data: dict) -> str:

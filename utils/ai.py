@@ -73,6 +73,15 @@ def _safe_json_parse(content: str) -> dict:
 
 
 def _to_number(value: str):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
     cleaned = (value or "").strip().lower()
     if not cleaned:
         return None
@@ -339,7 +348,7 @@ def extract_shareholders_ai(data: dict) -> list[dict]:
     AI fallback untuk shareholder
     - aware symbol / year / quarter
     - PRIORITAS: data dari dokumen
-    - OPTIONAL: external lookup (kalau lo mau aktifkan)
+    - OPTIONAL: external lookup
     """
 
     report_text = (data.get("report_text") or "").strip()
@@ -434,6 +443,163 @@ def extract_shareholders_ai(data: dict) -> list[dict]:
                 "ownership": item.get("ownership"),
             })
 
+        return clean
+
+    except Exception:
+        return []
+
+def _safe_json_list_parse(content: str) -> list:
+    text = (content or "").strip()
+    if not text:
+        return []
+
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _to_int(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        parsed = _to_number(value)
+        if parsed is None:
+            return None
+        try:
+            return int(parsed)
+        except Exception:
+            return None
+    return None
+
+
+def extract_shareholders_ai(data: dict) -> list[dict]:
+    report_text = (data.get("report_text") or "").strip()
+    symbol = data.get("symbol", "")
+    year = data.get("year", "")
+    quarter = data.get("quarter", "")
+
+    print(
+        f"Running AI shareholder extraction for {symbol} {year} {quarter} "
+        f"with report text length: {len(report_text)} characters."
+    )
+
+    if not report_text:
+        return []
+
+    try:
+        prompt = f"""
+        Kamu adalah sistem data finansial.
+
+        Target:
+        - Emiten: {symbol}
+        - Tahun: {year}
+        - Periode: {quarter}
+
+        TUGAS:
+        Cari daftar pemegang saham terbesar (minimal 3 jika data tersedia).
+
+        RULE:
+        1. Cek dokumen terlebih dahulu.
+        2. Jika ADA di dokumen, gunakan data dari dokumen.
+        3. Jika TIDAK ADA di dokumen, boleh gunakan data publik valid (laporan tahunan/disclosure resmi).
+        4. Jangan mengarang. Jika tidak yakin, kembalikan [].
+        5. Ambil hanya pemegang saham utama, bukan baris modal/penerbitan saham.
+        6. Nama harus berupa entitas nyata (PT / pemerintah / institusi).
+        7. shares wajib integer jumlah lembar saham (tidak boleh null).
+        8. ownership wajib persen kepemilikan (0-100) (tidak boleh null).
+        9. Jika tidak bisa memberi shares+ownership valid, jangan kirim item itu.
+
+        FORMAT:
+        [
+        {{
+            "name": "...",
+            "shares": number/null,
+            "ownership": number/null
+        }}
+        ]
+
+        DOKUMEN:
+        {report_text[:12000]}
+        """.strip()
+
+        client = _build_client()
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Return ONLY valid JSON array."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+
+        content = response.choices[0].message.content or ""
+        parsed = _safe_json_list_parse(content)
+        if not parsed:
+            parsed_obj = _safe_json_parse(content)
+            nested = parsed_obj.get("shareholders") if isinstance(parsed_obj, dict) else None
+            if isinstance(nested, list):
+                parsed = nested
+
+        print(f"Raw content: {content}")
+        print(f"Parsed: {parsed}")
+
+        if not isinstance(parsed, list):
+            return []
+
+        clean = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+
+            name = item.get("name")
+            shares = _to_int(item.get("shares"))
+            ownership = _to_number(item.get("ownership"))
+            if ownership is not None:
+                try:
+                    ownership = float(ownership)
+                except Exception:
+                    ownership = None
+
+            if not name or not isinstance(name, str):
+                continue
+
+            if shares is None or shares <= 0:
+                continue
+
+            bad_keywords = ["penerbitan", "modal", "capital", "issued", "treasury"]
+            if any(b in name.lower() for b in bad_keywords):
+                continue
+
+            clean.append(
+                {
+                    "name": name.strip(),
+                    "shares": shares,
+                    "ownership": ownership if ownership is not None and (0 < ownership <= 100) else None,
+                }
+            )
+
+        clean = [
+            item
+            for item in clean
+            if item.get("shares") not in (None, 0)
+            and item.get("ownership") is not None
+            and 0 < item.get("ownership") <= 100
+        ]
+        clean.sort(key=lambda item: item.get("shares") or 0, reverse=True)
         return clean
 
     except Exception:

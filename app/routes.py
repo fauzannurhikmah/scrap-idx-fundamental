@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, current_app
-from app.scraper import scrape_fundamental, find_largest_shareholder
+from app.scraper import scrape_fundamental, find_shareholders
 from app.db import get_fundamental_result, save_fundamental_result
 from utils.ai import summarize_fundamental, extract_financial_metrics
 from utils.market import fetch_market_snapshot
@@ -7,6 +7,7 @@ from utils.market import fetch_market_snapshot
 bp = Blueprint("main", __name__)
 
 VALID_QUARTERS = {"Q1", "Q2", "Q3", "Q4"}
+INVALID_SHAREHOLDER_KEYWORDS = ("penerbitan", "modal", "capital", "issued", "treasury")
 
 
 def _pick_first(*values):
@@ -124,6 +125,72 @@ def _normalize_current_data(current_data):
     return normalized
 
 
+def _normalize_shareholder_response(payload):
+    if not isinstance(payload, dict):
+        return payload
+
+    shareholder = payload.get("shareholder")
+    if not isinstance(shareholder, dict):
+        payload["shareholder"] = {"largest": []}
+        return payload
+
+    largest = shareholder.get("largest")
+    if isinstance(largest, list):
+        payload["shareholder"] = {"largest": largest}
+        return payload
+    if isinstance(largest, dict):
+        payload["shareholder"] = {"largest": [largest]}
+        return payload
+
+    payload["shareholder"] = {"largest": []}
+    return payload
+
+
+def _to_int_number(value):
+    number = _to_number(value)
+    if number is None:
+        return None
+    try:
+        return int(number)
+    except Exception:
+        return None
+
+
+def _normalize_shareholder_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    name = str(entry.get("name") or "").strip()
+    if not name:
+        return None
+
+    if any(keyword in name.lower() for keyword in INVALID_SHAREHOLDER_KEYWORDS):
+        return None
+
+    shares = _to_int_number(entry.get("shares"))
+    if shares is None or shares <= 0:
+        return None
+
+    ownership = _to_number(entry.get("ownership"))
+    if ownership is not None:
+        try:
+            ownership = float(ownership)
+        except Exception:
+            ownership = None
+    if ownership is None:
+        return None
+    if not (0 < ownership <= 100):
+        ownership = None
+    if ownership is None:
+        return None
+
+    return {
+        "name": name,
+        "shares": shares,
+        "ownership": ownership,
+    }
+
+
 @bp.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -159,6 +226,18 @@ def get_fundamental():
     try:
         cached_payload = get_fundamental_result(symbol, year, request_period)
         if cached_payload:
+            cached_payload = _normalize_shareholder_response(cached_payload)
+            cached_largest = ((cached_payload.get("shareholder") or {}).get("largest") or [])
+            if isinstance(cached_largest, list) and not cached_largest:
+                current_app.logger.info(
+                    "Cached payload has empty shareholder list for %s %s %s, refreshing from source.",
+                    symbol,
+                    year,
+                    request_period,
+                )
+                cached_payload = None
+
+        if cached_payload:
             current_app.logger.info(
                 "Returning cached fundamental payload from database for %s %s %s",
                 symbol,
@@ -183,38 +262,59 @@ def get_fundamental():
             "message": "Failed to retrieve data from IDX. Please try again later."
         }), 502
     
-    try:
-        report_text = fundamental_data.get("report_text") or ""
+    report_text = fundamental_data.get("report_text") or ""
+    shareholders = []
 
-        largest_shareholder = None
+    if report_text:
+        try:
+            extracted_shareholders = find_shareholders(report_text)
+        except Exception as exc:
+            current_app.logger.warning(
+                "Shareholder screening from report failed for %s %s %s: %s",
+                symbol,
+                year,
+                request_period,
+                exc,
+            )
+            extracted_shareholders = []
 
-        if report_text:
-            largest_shareholder = find_largest_shareholder(report_text)
+        if isinstance(extracted_shareholders, list):
+            for item in extracted_shareholders:
+                normalized_item = _normalize_shareholder_entry(item)
+                if normalized_item:
+                    shareholders.append(normalized_item)
+        if shareholders:
+            shareholders.sort(key=lambda item: item.get("shares") or 0, reverse=True)
 
-        # filter out non-shareholder entries (e.g. "Penerbitan Saham Baru", "Modal Disetor", etc.)
-        if isinstance(largest_shareholder, dict):
-            name = largest_shareholder.get("name", "").lower()
-            if any(b in name for b in ["penerbitan", "modal", "capital"]):
-                largest_shareholder = None
+    print(f"Extracted shareholders for {symbol} {year} {request_period}: {shareholders}")
 
-        print(f"Extracted largest shareholder for {symbol} {year} {request_period}: {largest_shareholder}")
-        # fallback AI
-        if not largest_shareholder:
-            from utils.ai import extract_shareholders_ai
+    # fallback AI only when report does not provide valid shareholder rows
+    if not shareholders:
+        from utils.ai import extract_shareholders_ai
+        try:
             ai_data = extract_shareholders_ai(fundamental_data)
-            print(f"AI extracted shareholders for {symbol} {year} {request_period}: {ai_data}")
+        except Exception as exc:
+            current_app.logger.warning(
+                "AI shareholder extraction failed for %s %s %s: %s",
+                symbol,
+                year,
+                request_period,
+                exc,
+            )
+            ai_data = []
 
-            if isinstance(ai_data, list) and ai_data:
-                largest_shareholder = ai_data[0]
+        print(f"AI extracted shareholders for {symbol} {year} {request_period}: {ai_data}")
+        if isinstance(ai_data, list):
+            for item in ai_data:
+                normalized_item = _normalize_shareholder_entry(item)
+                if normalized_item:
+                    shareholders.append(normalized_item)
+            if shareholders:
+                shareholders.sort(key=lambda item: item.get("shares") or 0, reverse=True)
 
-        fundamental_data["shareholder"] = {
-            "largest": largest_shareholder
-        }
-
-    except Exception:
-        fundamental_data["shareholder"] = {
-            "largest": None
-        }
+    fundamental_data["shareholder"] = {
+        "largest": shareholders if isinstance(shareholders, list) else [],
+    }
 
     market_snapshot = fetch_market_snapshot(symbol)
 
@@ -453,6 +553,7 @@ def get_fundamental():
         "shareholder": fundamental_data.get("shareholder"),
         "ai_summary": summary,
     }
+    response = _normalize_shareholder_response(response)
 
     try:
         save_fundamental_result(response)

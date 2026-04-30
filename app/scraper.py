@@ -71,6 +71,21 @@ FINANCIAL_TEXT_KEYWORDS = [
     "book value per share",
 ]
 
+# Shareholder keywords — nama & angka sering di baris terpisah, perlu context window lebih lebar
+SHAREHOLDER_TEXT_KEYWORDS = [
+    "pemegang saham",
+    "shareholder",
+    "komposisi pemegang saham",
+    "composition of shareholders",
+    "jumlah lembar saham",
+    "number of shares",
+    "persentase kepemilikan",
+    "percentage of ownership",
+    "kepemilikan saham",
+    "share ownership",
+    "daftar pemegang",
+]
+
 NUMERIC_ROW_RE = re.compile(r"\d[\d,\.]*")
 
 
@@ -169,22 +184,31 @@ def _focus_financial_text(raw_text: str) -> str:
     selected_indexes = set()
     for i, line in enumerate(lines):
         lower_line = line.lower()
+
+        # Financial metrics: harus ada keyword DAN angka di baris yang sama
         has_metric_keyword = any(keyword in lower_line for keyword in FINANCIAL_TEXT_KEYWORDS)
         has_numeric_value = bool(NUMERIC_ROW_RE.search(line))
-
         if has_metric_keyword and has_numeric_value:
             selected_indexes.add(i)
-            if i - 1 >= 0:
-                selected_indexes.add(i - 1)
-            if i + 1 < len(lines):
-                selected_indexes.add(i + 1)
+            for offset in (-1, 1):
+                j = i + offset
+                if 0 <= j < len(lines):
+                    selected_indexes.add(j)
+
+        # Shareholder: cukup ada keyword saja, ambil konteks +-8 baris
+        # karena nama pemegang saham dan angka sering di baris yang berbeda
+        has_shareholder_keyword = any(keyword in lower_line for keyword in SHAREHOLDER_TEXT_KEYWORDS)
+        if has_shareholder_keyword:
+            for offset in range(-8, 9):
+                j = i + offset
+                if 0 <= j < len(lines):
+                    selected_indexes.add(j)
 
     if not selected_indexes:
         return "\n".join(lines[:140])
 
     focused_lines = [lines[i] for i in sorted(selected_indexes)]
-    return "\n".join(focused_lines[:220])
-
+    return "\n".join(focused_lines[:300])
 
 def _collect_report_text(raw_data: dict) -> tuple[str, list[dict]]:
     attachments = raw_data.get("Attachments") or []
@@ -373,3 +397,104 @@ def scrape_fundamental(symbol: str, year: int, quarter: str | None = None) -> di
         "report_documents": parsed_documents,
         "raw_response": raw_data,
     }
+
+def find_shareholders(data: str) -> list[dict]:
+    """
+    Extract all shareholders from report text.
+    Returns a list of dicts with keys: name, shares, ownership.
+    Returns empty list if none found.
+    """
+    import re
+
+    if not data:
+        return []
+
+    print("data length:", len(data))
+    text = data
+
+    # Cari semua angka besar (format ribuan dengan titik, misal 1.234.567.890)
+    matches = list(re.finditer(r"\d{1,3}(?:\.\d{3}){2,}", text))
+
+    if not matches:
+        return []
+
+    print(f"Found {len(matches)} numeric candidates in text.")
+    candidates = []
+    seen_shares = set()
+
+    for m in matches:
+        raw_number = m.group(0)
+        shares = int(raw_number.replace(".", ""))
+
+        # Skip angka terlalu kecil (bukan jumlah saham signifikan)
+        if shares < 1_000_000:
+            continue
+
+        # Deduplicate angka yang sama persis
+        if shares in seen_shares:
+            continue
+        seen_shares.add(shares)
+
+        start = max(0, m.start() - 150)
+        end = min(len(text), m.end() + 150)
+        context = text[start:end]
+
+        # Cari persentase kepemilikan di sekitar angka
+        percent_match = re.search(r"\b\d{1,3}[,\.]\d{2}\b", context)
+        ownership = None
+        if percent_match:
+            try:
+                ownership = float(percent_match.group(0).replace(",", "."))
+                # Validasi range persentase wajar
+                if not (0 < ownership <= 100):
+                    ownership = None
+            except ValueError:
+                ownership = None
+
+        # Ambil nama dari baris sebelum angka
+        before_number = context.split(raw_number)[0]
+        lines = [l.strip() for l in before_number.strip().split("\n") if l.strip()]
+        name = lines[-1] if lines else ""
+        name = re.sub(r"\d[\d\.,]*", "", name).strip()
+        name = re.sub(r"\s{2,}", " ", name).strip(" |:-")
+
+        if not name:
+            continue
+
+        #  FILTER WAJIB: harus ada konteks shareholder
+        if not any(k in context.lower() for k in [
+            "pemegang saham",
+            "shareholder",
+            "komposisi pemegang saham"
+        ]):
+            continue
+
+        # FILTER NOISE (hindari modal/penerbitan)
+        if any(bad in context.lower() for bad in [
+            "modal",
+            "penerbitan",
+            "issued",
+            "capital",
+            "treasury"
+        ]):
+            continue
+
+        candidates.append({
+            "name": name,
+            "shares": shares,
+            "ownership": ownership,
+        })
+
+    # Urutkan dari terbesar ke terkecil
+    candidates.sort(key=lambda x: x["shares"], reverse=True)
+
+    return candidates
+
+
+# Alias untuk backward compatibility
+def find_largest_shareholder(data: str):
+    shareholders = find_shareholders(data)
+    if not shareholders:
+        print("No shareholders found in text.")
+        return None 
+    return shareholders[0]

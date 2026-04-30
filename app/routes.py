@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, current_app
-from app.scraper import scrape_fundamental
+from app.scraper import scrape_fundamental, find_largest_shareholder
 from app.db import get_fundamental_result, save_fundamental_result
 from utils.ai import summarize_fundamental, extract_financial_metrics
 from utils.market import fetch_market_snapshot
@@ -182,6 +182,39 @@ def get_fundamental():
             "status": "error",
             "message": "Failed to retrieve data from IDX. Please try again later."
         }), 502
+    
+    try:
+        report_text = fundamental_data.get("report_text") or ""
+
+        largest_shareholder = None
+
+        if report_text:
+            largest_shareholder = find_largest_shareholder(report_text)
+
+        # filter out non-shareholder entries (e.g. "Penerbitan Saham Baru", "Modal Disetor", etc.)
+        if isinstance(largest_shareholder, dict):
+            name = largest_shareholder.get("name", "").lower()
+            if any(b in name for b in ["penerbitan", "modal", "capital"]):
+                largest_shareholder = None
+
+        print(f"Extracted largest shareholder for {symbol} {year} {request_period}: {largest_shareholder}")
+        # fallback AI
+        if not largest_shareholder:
+            from utils.ai import extract_shareholders_ai
+            ai_data = extract_shareholders_ai(fundamental_data)
+            print(f"AI extracted shareholders for {symbol} {year} {request_period}: {ai_data}")
+
+            if isinstance(ai_data, list) and ai_data:
+                largest_shareholder = ai_data[0]
+
+        fundamental_data["shareholder"] = {
+            "largest": largest_shareholder
+        }
+
+    except Exception:
+        fundamental_data["shareholder"] = {
+            "largest": None
+        }
 
     market_snapshot = fetch_market_snapshot(symbol)
 
@@ -417,6 +450,7 @@ def get_fundamental():
             "has_cogs": current_data.get("has_cogs", False),
             "has_current_assets": current_data.get("has_current_assets", False),
         },
+        "shareholder": fundamental_data.get("shareholder"),
         "ai_summary": summary,
     }
 

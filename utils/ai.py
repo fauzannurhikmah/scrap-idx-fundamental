@@ -325,3 +325,116 @@ Tugas:
     )
 
     return response.choices[0].message.content.strip()
+
+
+from openai import OpenAI
+import json
+from config.settings import OPENAI_API_KEY
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def extract_shareholders_ai(data: dict) -> list[dict]:
+    """
+    AI fallback untuk shareholder
+    - aware symbol / year / quarter
+    - PRIORITAS: data dari dokumen
+    - OPTIONAL: external lookup (kalau lo mau aktifkan)
+    """
+
+    report_text = (data.get("report_text") or "").strip()
+    symbol = data.get("symbol", "")
+    year = data.get("year", "")
+    quarter = data.get("quarter", "")
+
+    print(f"Running AI shareholder extraction for {symbol} {year} {quarter} with report text length: {len(report_text)} characters.")
+
+    if not report_text:
+        return []
+
+    try:
+        prompt = f"""
+        Kamu adalah sistem data finansial.
+
+        Target:
+        - Emiten: {symbol}
+        - Tahun: {year}
+        - Periode: {quarter}
+
+        TUGAS:
+        Cari pemegang saham terbesar.
+
+        RULE:
+        1. Cek dokumen terlebih dahulu
+        2. Jika ADA di dokumen → gunakan itu
+        3. Jika TIDAK ADA di dokumen:
+        → gunakan data publik VALID untuk emiten ini
+        → contoh: laporan tahunan, data kepemilikan resmi
+        4. Jangan mengarang
+        5. Ambil hanya pemegang saham utama (bukan direksi kecil)
+        6. Nama harus berupa entitas nyata (PT / pemerintah / institusi)
+
+        FORMAT:
+        [
+        {{
+            "name": "...",
+            "shares": number/null,
+            "ownership": number/null
+        }}
+        ]
+
+        DOKUMEN:
+        {report_text[:12000]}
+        """
+
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Return ONLY valid JSON array."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+
+        content = response.choices[0].message.content.strip()
+        parsed = json.loads(content)
+
+        print(f"Raw content: {content}")
+        print(f"Parsed: {parsed}")
+
+        if not isinstance(parsed, list):
+            return []
+
+        # VALIDATION LAYER
+        clean = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+
+            name = item.get("name")
+            shares = item.get("shares")
+
+            if not name or not isinstance(name, str):
+                continue
+
+            if not isinstance(shares, (int, float)):
+                continue
+
+            if shares <= 0:
+                continue
+
+            # filter noise
+            bad_keywords = ["penerbitan", "modal", "capital", "issued"]
+            if any(b in name.lower() for b in bad_keywords):
+                continue
+
+            clean.append({
+                "name": name.strip(),
+                "shares": int(shares),
+                "ownership": item.get("ownership"),
+            })
+
+        return clean
+
+    except Exception:
+        return []

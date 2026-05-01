@@ -67,6 +67,7 @@ class FundamentalResult(Base):
     ratios = Column(JSONB, nullable=False, default=dict)
     growth = Column(JSONB, nullable=False, default=dict)
     raw_flags = Column(JSONB, nullable=False, default=dict)
+    shareholder = Column(JSONB, nullable=False, default=dict)
     ai_summary = Column(Text, nullable=True)
     payload = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -115,6 +116,7 @@ def _ensure_schema() -> None:
         "ratios": "JSONB NOT NULL DEFAULT '{}'::jsonb",
         "growth": "JSONB NOT NULL DEFAULT '{}'::jsonb",
         "raw_flags": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "shareholder": "JSONB NOT NULL DEFAULT '{}'::jsonb",
         "ai_summary": "TEXT",
         "payload": "JSONB NOT NULL DEFAULT '{}'::jsonb",
         "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
@@ -162,6 +164,7 @@ def get_fundamental_result(symbol: str, year: int, quarter: str | None = None):
                     FundamentalResult.ratios,
                     FundamentalResult.growth,
                     FundamentalResult.raw_flags,
+                    FundamentalResult.shareholder,
                     FundamentalResult.ai_summary,
                 ).where(
                     FundamentalResult.kode_emiten == normalized_symbol,
@@ -181,7 +184,7 @@ def get_fundamental_result(symbol: str, year: int, quarter: str | None = None):
     if not row:
         return None
 
-    payload, meta, financials, market, ratios, growth, raw_flags, ai_summary = row
+    payload, meta, financials, market, ratios, growth, raw_flags, shareholder, ai_summary = row
     if payload:
         logger.info(
             "Loaded fundamental result from database: %s %s %s",
@@ -198,6 +201,7 @@ def get_fundamental_result(symbol: str, year: int, quarter: str | None = None):
         "ratios": ratios or {},
         "growth": growth or {},
         "raw_flags": raw_flags or {},
+        "shareholder": shareholder or {"largest": []},
         "ai_summary": ai_summary or "",
     }
 
@@ -209,6 +213,7 @@ def save_fundamental_result(payload: dict) -> None:
     ratios = payload.get("ratios") or {}
     growth = payload.get("growth") or {}
     raw_flags = payload.get("raw_flags") or {}
+    shareholder = payload.get("shareholder") or {"largest": []}
     ai_summary = payload.get("ai_summary")
 
     kode_emiten = _normalize_symbol(meta.get("kode_emiten"))
@@ -257,6 +262,7 @@ def save_fundamental_result(payload: dict) -> None:
                     ratios=ratios,
                     growth=growth,
                     raw_flags=raw_flags,
+                    shareholder=shareholder,
                     ai_summary=ai_summary,
                     payload=payload,
                 )
@@ -268,6 +274,7 @@ def save_fundamental_result(payload: dict) -> None:
                 existing.ratios = ratios
                 existing.growth = growth
                 existing.raw_flags = raw_flags
+                existing.shareholder = shareholder
                 existing.ai_summary = ai_summary
                 existing.payload = payload
 
